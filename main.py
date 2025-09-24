@@ -136,13 +136,19 @@ async def copy_bet_message(original_message: discord.Message, sheet_row_number: 
             if field.name == "📋 Betslip":
                 betslip = field.value
 
-        # Create the formatted message with betslip if available
-        formatted_message = f"<@&{ROLE_ID}>\n🔒 {bet_description} @{odds} - {units}u"
+        # Create the formatted message with betslip if available (REMOVED EMOJI STATUS)
+        formatted_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} - {units}u"
 
         if betslip:
             formatted_message += f"\n{betslip}"
 
         copy_message = await destination_channel.send(formatted_message)
+
+        # Add dollar emoji reaction to the copy message
+        try:
+            await copy_message.add_reaction('💵')
+        except Exception as e:
+            print(f"⚠️ Could not add dollar emoji reaction: {e}")
 
         # Store the copy message ID in Google Sheets
         try:
@@ -254,21 +260,37 @@ async def update_copied_message(sheet_row_number: int, original_message: discord
                 status = "Open"
                 betslip = ""
 
-        # Create the updated formatted message based on status
-        status_emoji = {
-            "Open": "🔒",
-            "Won": "✅",
-            "Lost": "❌",
-            "Draw": "🤝"
-        }
-        emoji = status_emoji.get(status, "🔒")
-
-        formatted_message = f"<@&{ROLE_ID}>\n{emoji} {bet_description} @{odds} - {units}u"
+        # Create the updated formatted message (REMOVED EMOJI STATUS)
+        formatted_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} - {units}u"
 
         if betslip:
             formatted_message += f"\n{betslip}"
 
         await copy_message.edit(content=formatted_message)
+
+        # Update reactions based on status
+        try:
+            # Remove all existing status emojis
+            status_emojis = ['✅', '❌', '🔄']  # white_check_mark, x, repeat
+            for emoji in status_emojis:
+                async for user in copy_message.reactions:
+                    if str(user.emoji) == emoji:
+                        await copy_message.clear_reaction(emoji)
+                        break
+
+            # Add new status emoji based on current status
+            status_emoji_map = {
+                "Won": "✅",
+                "Lost": "❌", 
+                "Draw": "🔄"
+            }
+            
+            if status in status_emoji_map:
+                await copy_message.add_reaction(status_emoji_map[status])
+                
+        except Exception as e:
+            print(f"⚠️ Error updating reactions: {e}")
+
         print(f"✅ Updated copy message for row {sheet_row_number} with status: {status}")
         return True
 
