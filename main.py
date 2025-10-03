@@ -12,6 +12,7 @@ import matplotlib.dates as mdates
 import io
 import os
 import json
+import aiohttp
 
 # Configuration
 DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN', 'YOUR_BOT_TOKEN_HERE')
@@ -20,6 +21,8 @@ SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '1ZdZVIwUkBeEA6VFhS5lfZQbH9oZ1
 ROLE_ID = int(os.environ.get('ROLE_ID', '935863068636897300'))
 AUTHORIZED_ROLE_ID = int(os.environ.get('AUTHORIZED_ROLE_ID', '123456789012345678'))
 DESTINATION_CHANNEL_ID = int(os.environ.get('DESTINATION_CHANNEL_ID', '1369427073567031436'))
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID', '')
 
 GOOGLE_SHEETS_CREDENTIALS = 'credentials.json'
 
@@ -75,6 +78,83 @@ def get_status_color(status: str) -> discord.Color:
         "Draw": discord.Color.gold()
     }
     return color_map.get(status, discord.Color.blue())
+
+async def forward_to_telegram(message_content: str, sheet_row_number: int = None) -> Optional[str]:
+    """
+    Forward regular message content to Telegram channel
+    Returns message ID if successful, None if failed or not configured
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        return None
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        
+        payload = {
+            "chat_id": TELEGRAM_CHANNEL_ID,
+            "text": message_content,
+            "parse_mode": "HTML"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    message_id = str(result['result']['message_id'])
+                    
+                    # Store Telegram message ID if sheet row provided
+                    if sheet_row_number:
+                        try:
+                            client = get_google_sheets_client()
+                            if client:
+                                spreadsheet = client.open_by_key(SPREADSHEET_ID)
+                                worksheet = spreadsheet.get_worksheet(0)
+                                # Use column 13 for Telegram message ID
+                                worksheet.update_cell(sheet_row_number, 13, message_id)
+                                print(f"✅ Stored Telegram message ID {message_id} for row {sheet_row_number}")
+                        except Exception as e:
+                            print(f"⚠️ Error storing Telegram message ID: {e}")
+                    
+                    print(f"✅ Message forwarded to Telegram: {message_id}")
+                    return message_id
+                else:
+                    print(f"❌ Telegram API error: {response.status}")
+                    return None
+
+    except Exception as e:
+        print(f"❌ Error forwarding to Telegram: {e}")
+        return None
+
+async def edit_telegram_message(message_id: str, new_content: str) -> bool:
+    """
+    Edit existing Telegram message with new content
+    Returns True if successful, False if failed
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+        
+        payload = {
+            "chat_id": TELEGRAM_CHANNEL_ID,
+            "message_id": int(message_id),
+            "text": new_content,
+            "parse_mode": "HTML"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    print(f"✅ Telegram message {message_id} updated")
+                    return True
+                else:
+                    print(f"❌ Telegram edit error: {response.status}")
+                    return False
+
+    except Exception as e:
+        print(f"❌ Error editing Telegram message: {e}")
+        return False
 
 async def has_button_permission(interaction: discord.Interaction, sheet_row_number: int) -> bool:
     """Check if user has permission to modify a bet"""
@@ -140,16 +220,20 @@ async def copy_bet_message(original_message: discord.Message, sheet_row_number: 
             if field.name == "⚔️ Versus":
                 versus = field.value
 
-        # Format message with versus if available
+        # Format message with versus if available (WITH role ping for Discord)
         if versus and versus.strip():
-            formatted_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} vs {versus} - {units}u"
+            discord_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} vs {versus} - {units}u"
+            telegram_message = f"{bet_description} @{odds} vs {versus} - {units}u"  # No role ping
         else:
-            formatted_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} - {units}u"
+            discord_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} - {units}u"
+            telegram_message = f"{bet_description} @{odds} - {units}u"  # No role ping
 
         if betslip:
-            formatted_message += f"\n{betslip}"
+            discord_message += f"\n{betslip}"
+            telegram_message += f"\n{betslip}"
 
-        copy_message = await destination_channel.send(formatted_message)
+        # Send to Discord
+        copy_message = await destination_channel.send(discord_message)
 
         # Add dollar emoji reaction
         try:
@@ -168,6 +252,13 @@ async def copy_bet_message(original_message: discord.Message, sheet_row_number: 
         except Exception as e:
             print(f"❌ Error storing copy message ID: {e}")
 
+        # FORWARD TO TELEGRAM (without role ping)
+        telegram_id = await forward_to_telegram(telegram_message, sheet_row_number)
+        if telegram_id:
+            print(f"✅ Message forwarded to Telegram with ID: {telegram_id}")
+        else:
+            print("⚠️ Message not forwarded to Telegram (not configured or failed)")
+
         return copy_message.id
 
     except Exception as e:
@@ -185,12 +276,14 @@ async def update_copied_message(sheet_row_number: int, original_message: discord
         worksheet = spreadsheet.get_worksheet(0)
 
         copy_message_id = worksheet.cell(sheet_row_number, 11).value
-        if not copy_message_id:
-            print(f"❌ No copy message ID found for row {sheet_row_number}")
+        telegram_message_id = worksheet.cell(sheet_row_number, 13).value
+        
+        if not copy_message_id and not telegram_message_id:
+            print(f"❌ No copy message IDs found for row {sheet_row_number}")
             return False
 
         destination_channel = bot.get_channel(DESTINATION_CHANNEL_ID)
-        if not destination_channel:
+        if not destination_channel and copy_message_id:
             print(f"❌ Destination channel {DESTINATION_CHANNEL_ID} not found")
             return False
 
@@ -209,23 +302,12 @@ async def update_copied_message(sheet_row_number: int, original_message: discord
             except:
                 return False
 
-        try:
-            copy_message = await destination_channel.fetch_message(int(copy_message_id))
-        except discord.NotFound:
-            print(f"❌ Copy message {copy_message_id} not found, creating new copy")
-            new_copy_id = await copy_bet_message(original_message, sheet_row_number)
-            return new_copy_id is not None
-        except Exception as e:
-            print(f"❌ Error fetching copy message: {e}")
-            return False
-
         # Extract data from Google Sheets
         try:
             row_data = worksheet.row_values(sheet_row_number)
             bet_description = row_data[3] if len(row_data) > 3 else "Unknown Bet"
             odds = row_data[4] if len(row_data) > 4 else "?"
             units = row_data[5] if len(row_data) > 5 else "?"
-            status = row_data[2] if len(row_data) > 2 else "Open"
             betslip = row_data[6] if len(row_data) > 6 and row_data[6] and row_data[6] != "None" else ""
             versus = row_data[11] if len(row_data) > 11 and row_data[11] and row_data[11] != "None" else ""
 
@@ -239,19 +321,6 @@ async def update_copied_message(sheet_row_number: int, original_message: discord
                 units = "?"
                 betslip = ""
                 versus = ""
-
-                status = "Open"
-                if original_embed.description and "Status:" in original_embed.description:
-                    status_match = re.search(r"Status:\s*\*\*(\w+)\*\*", original_embed.description)
-                    if status_match:
-                        status = status_match.group(1)
-                    else:
-                        if "Won" in original_embed.description:
-                            status = "Won"
-                        elif "Lost" in original_embed.description:
-                            status = "Lost"
-                        elif "Draw" in original_embed.description:
-                            status = "Draw"
 
                 for field in original_embed.fields:
                     if "Odds:" in field.name and "Units:" in field.name:
@@ -272,60 +341,40 @@ async def update_copied_message(sheet_row_number: int, original_message: discord
                 bet_description = "Unknown Bet"
                 odds = "?"
                 units = "?"
-                status = "Open"
                 betslip = ""
                 versus = ""
 
-        # Create updated message
+        # Create updated messages
         if versus and versus.strip():
-            formatted_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} vs {versus} - {units}u"
+            discord_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} vs {versus} - {units}u"
+            telegram_message = f"{bet_description} @{odds} vs {versus} - {units}u"  # No role ping
         else:
-            formatted_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} - {units}u"
+            discord_message = f"<@&{ROLE_ID}>\n{bet_description} @{odds} - {units}u"
+            telegram_message = f"{bet_description} @{odds} - {units}u"  # No role ping
 
         if betslip:
-            formatted_message += f"\n{betslip}"
+            discord_message += f"\n{betslip}"
+            telegram_message += f"\n{betslip}"
 
-        await copy_message.edit(content=formatted_message)
+        # Update Discord message
+        if copy_message_id and copy_message_id != "PENDING":
+            try:
+                copy_message = await destination_channel.fetch_message(int(copy_message_id))
+                await copy_message.edit(content=discord_message)
+                print(f"✅ Updated Discord copy message for row {sheet_row_number}")
+            except Exception as e:
+                print(f"❌ Error updating Discord copy message: {e}")
 
-        # Update reactions based on status
-        try:
-            status_emoji_map = {
-                "Won": "✅",
-                "Lost": "❌", 
-                "Draw": "🔄"
-            }
-            
-            current_reactions = [str(reaction.emoji) for reaction in copy_message.reactions]
-            
-            print(f"🔍 Current reactions: {current_reactions}, Target status: {status}")
-            
-            # Remove all existing status emojis
-            for status_emoji in status_emoji_map.values():
-                if status_emoji in current_reactions:
-                    await copy_message.clear_reaction(status_emoji)
-                    print(f"🗑️ Removed {status_emoji} reaction")
-                    current_reactions = [str(reaction.emoji) for reaction in copy_message.reactions]
-            
-            # For Open status: only keep dollar emoji
-            if status == "Open":
-                if "<:takemymoney:1255883106553172090>" not in current_reactions:
-                    await copy_message.add_reaction('<:takemymoney:1255883106553172090>')
-                    print("<:takemymoney:1255883106553172090> Added dollar emoji for Open status")
-                print(f"✅ Reset reactions for Open status - only <:takemymoney:1255883106553172090> remains")
+        # Update Telegram message
+        if telegram_message_id:
+            telegram_success = await edit_telegram_message(telegram_message_id, telegram_message)
+            if telegram_success:
+                print(f"✅ Telegram message synced for row {sheet_row_number}")
             else:
-                # For settled statuses: add both dollar and status emoji
-                if status in status_emoji_map:
-                    if "<:takemymoney:1255883106553172090>" not in current_reactions:
-                        await copy_message.add_reaction('<:takemymoney:1255883106553172090>')
-                        print("<:takemymoney:1255883106553172090> Added dollar emoji")
-                    
-                    await copy_message.add_reaction(status_emoji_map[status])
-                    print(f"✅ Added {status_emoji_map[status]} reaction for {status} status")
-                    
-        except Exception as e:
-            print(f"⚠️ Error updating reactions: {e}")
+                print(f"⚠️ Telegram sync failed for row {sheet_row_number}")
+        else:
+            print(f"⚠️ No Telegram message to update for row {sheet_row_number}")
 
-        print(f"✅ Updated copy message for row {sheet_row_number} with status: {status}")
         return True
 
     except Exception as e:
